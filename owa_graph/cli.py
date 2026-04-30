@@ -1,0 +1,407 @@
+"""Argument parsing and dispatch for the `owa-graph` command.
+
+owa-graph is verb-first: `owa-graph GET /me`, `owa-graph POST /me/sendMail
+--body @msg.json`. JSON on stdout, logs on stderr, --pretty for humans,
+--curl/--az to render the equivalent shell command without executing.
+
+Subcommands are parsed manually (no argparse subparsers) to keep the
+code flat and to mirror owa-cal/owa-mail. Each cmd_* fn is responsible
+for its own flag loop.
+"""
+import json
+import os
+import sys
+
+from . import api as api_mod
+from . import auth as auth_mod
+from . import config as config_mod
+from . import emit as emit_mod
+from . import format as format_mod
+
+HTTP_VERBS = {'GET', 'POST', 'PATCH', 'PUT', 'DELETE'}
+RESERVED_SUBCOMMANDS = {'refresh', 'config', 'help'}
+
+
+def _error(msg):
+    print(f'ERROR: {msg}', file=sys.stderr)
+
+
+def _info(msg):
+    print(msg, file=sys.stderr)
+
+
+def _debug_enabled(config):
+    return bool(config.get('debug')) or os.environ.get('GRAPH_DEBUG') == '1'
+
+
+def _require_value(flag, args):
+    if not args:
+        _error(f'{flag} requires a value')
+        sys.exit(1)
+    return args[0], args[1:]
+
+
+def print_help():
+    print("""owa-graph - Microsoft Graph CLI for one-off queries
+
+Usage: owa-graph <METHOD> <path> [options]
+       owa-graph refresh
+       owa-graph config [--profile <alias>] [--app-client-id <id>] [--audience <name>]
+
+METHOD: GET | POST | PATCH | PUT | DELETE  (case-insensitive)
+path:   /me, /users, '/users?$top=5', me/messages/<id>  (leading slash optional)
+
+Per-call options:
+  --body <json|@file|->     Request body. Literal JSON, @path-to-file,
+                            or - to read from stdin.
+  --header K=V              Extra header (repeatable).
+  --query K=V               OData query parameter (repeatable; URL-encoded).
+  --select F1,F2            Shortcut for --query '$select=F1,F2'.
+  --top N                   Shortcut for --query '$top=N'.
+  --filter EXPR             Shortcut for --query '$filter=EXPR'.
+  --beta                    Use https://graph.microsoft.com/beta (graph audience only).
+  --audience <name>         Forward to owa-piggy. Default: graph.
+                            Known: graph, outlook, teams, azure, keyvault,
+                            storage, sql, outlook365, substrate, manage,
+                            powerbi, flow, devops.
+  --pretty                  Human-readable output (tables for users/messages/
+                            drive items; indented JSON otherwise).
+  --raw                     Print raw response bytes (no JSON parsing).
+                            Useful for $value endpoints that return binary.
+  --curl                    Print equivalent curl command and exit. No HTTP call.
+  --az                      Print equivalent `az rest` command and exit.
+
+Global options:
+  --debug, --verbose        Print HTTP requests and response bodies on errors
+                            (also: GRAPH_DEBUG=1).
+  --profile <alias>         Forward to owa-piggy as --profile <alias>
+                            (overrides owa_piggy_profile in the config file
+                            and OWA_PROFILE in the env).
+
+Environment:
+  GRAPH_DEBUG=1             Same as --debug.
+  OWA_PROFILE=<alias>       Inherited by the owa-piggy subprocess. Lower
+                            precedence than --profile and the config file pin.
+  OWA_REFRESH_TOKEN,        Env-only mode: passed through to owa-piggy so it
+  OWA_TENANT_ID             can mint tokens with no on-disk config. Enables
+                            single-line uvx (`uvx owa-graph GET /me`).
+  GRAPH_APP_CLIENT_ID,      App-registration path: bypass owa-piggy and call
+  GRAPH_REFRESH_TOKEN,      AAD directly. Useful when you need broader Graph
+  GRAPH_TENANT_ID           scopes than the OWA first-party SPA carries.
+
+Auth:
+  Default path: owa-graph shells out to owa-piggy for a fresh access
+  token on every call. owa-piggy owns the refresh token; owa-graph
+  stores only an optional profile alias and a default audience.
+
+  App-registration path: set GRAPH_APP_CLIENT_ID (plus GRAPH_REFRESH_TOKEN
+  and GRAPH_TENANT_ID) in ~/.config/owa-graph/config and owa-graph talks
+  to the AAD token endpoint directly with `.default` scope.
+
+  Quickstart:
+    brew install damsleth/tap/owa-piggy
+    owa-piggy setup                 # or: setup --profile work
+
+Scope caveat:
+  The OWA first-party SPA client owa-piggy borrows does NOT carry full
+  Graph permissions. Calls like GET /me, /users, /me/joinedTeams and
+  most directory queries work; calendar/mail/files writes via Graph
+  return 403. Set GRAPH_APP_CLIENT_ID to broaden scope, or use the
+  audience-specific siblings (owa-cal, owa-mail) which target the
+  Outlook REST audience instead.
+
+Examples:
+  owa-graph GET /me
+  owa-graph GET '/users?$top=5' --pretty
+  owa-graph GET /me/messages --top 10 --select id,subject,from
+  owa-graph POST /me/sendMail --body @mail.json
+  owa-graph PATCH /me/messages/AAMk... --body '{"isRead":true}'
+  owa-graph GET /me/drive/root/children --beta
+  owa-graph GET /me --curl | pbcopy
+  owa-graph GET me/events --audience outlook --pretty
+  owa-graph refresh""")
+
+
+def _resolve_body(arg):
+    """Returns (body_value, is_file_ref). body_value is the JSON-decoded
+    object for literal/stdin input, or the raw string for @file-refs
+    (which we keep as a path so curl/az can handle the file)."""
+    if arg == '-':
+        raw = sys.stdin.read()
+        try:
+            return json.loads(raw), False
+        except json.JSONDecodeError as e:
+            _error(f'stdin body is not valid JSON: {e}')
+            sys.exit(1)
+    if arg.startswith('@'):
+        path = arg[1:]
+        return path, True
+    try:
+        return json.loads(arg), False
+    except json.JSONDecodeError as e:
+        _error(f'--body is not valid JSON: {e}')
+        sys.exit(1)
+
+
+def _read_file_body(path):
+    """Read a @file body from disk for actual HTTP execution (not curl/az
+    rendering, which keeps the @path reference)."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except OSError as e:
+        _error(f'cannot read body file {path!r}: {e}')
+        sys.exit(1)
+
+
+def cmd_request(method, path, args, config):
+    body = None
+    body_is_file_ref = False
+    headers = {}
+    query_pairs = []
+    audience = config.get('default_audience') or 'graph'
+    beta = False
+    pretty = False
+    raw = False
+    emit_mode = None
+
+    while args:
+        flag, args = args[0], args[1:]
+        if flag == '--body':
+            v, args = _require_value(flag, args)
+            body, body_is_file_ref = _resolve_body(v)
+        elif flag == '--header':
+            v, args = _require_value(flag, args)
+            if '=' not in v:
+                _error(f"--header expects K=V, got: {v!r}")
+                return 1
+            k, _, val = v.partition('=')
+            headers[k.strip()] = val.strip()
+        elif flag == '--query':
+            v, args = _require_value(flag, args)
+            if '=' not in v:
+                _error(f"--query expects K=V, got: {v!r}")
+                return 1
+            k, _, val = v.partition('=')
+            query_pairs.append((k.strip(), val.strip()))
+        elif flag == '--select':
+            v, args = _require_value(flag, args)
+            query_pairs.append(('$select', v))
+        elif flag == '--top':
+            v, args = _require_value(flag, args)
+            query_pairs.append(('$top', v))
+        elif flag == '--filter':
+            v, args = _require_value(flag, args)
+            query_pairs.append(('$filter', v))
+        elif flag == '--audience':
+            audience, args = _require_value(flag, args)
+        elif flag == '--beta':
+            beta = True
+        elif flag == '--pretty':
+            pretty = True
+        elif flag == '--raw':
+            raw = True
+        elif flag == '--curl':
+            emit_mode = 'curl'
+        elif flag == '--az':
+            emit_mode = 'az'
+        else:
+            _error(f'Unknown flag: {flag}'); return 1
+
+    debug = _debug_enabled(config)
+
+    # In emit mode we still need a token (so the rendered command is
+    # immediately runnable) but we never make the actual API call.
+    access_token, api_base = auth_mod.setup_auth(
+        config, audience=audience, beta=beta, debug=debug,
+    )
+
+    url = api_mod.build_url(api_base, path, query_pairs)
+
+    if emit_mode == 'curl':
+        print(emit_mod.render_curl(
+            method, url, access_token,
+            headers=headers, body=body, body_is_file_ref=body_is_file_ref,
+        ))
+        return 0
+    if emit_mode == 'az':
+        print(emit_mod.render_az(
+            method, url, access_token,
+            headers=headers, body=body, body_is_file_ref=body_is_file_ref,
+        ))
+        return 0
+
+    # Resolve @file body for the actual call.
+    request_body = body
+    if body_is_file_ref:
+        request_body = _read_file_body(body)
+
+    # api_request joins base+endpoint with `/`, but we already built the
+    # full URL above. Pass a synthetic base of '' and the absolute URL
+    # as the endpoint - api_request honors `http`-prefixed endpoints.
+    result = api_mod.api_request(
+        method, '', url, access_token,
+        body=request_body, extra_headers=headers,
+        debug=debug, raw=raw,
+    )
+
+    if result is None:
+        return 1
+
+    if raw:
+        # bytes - write directly to the underlying stdout buffer to avoid
+        # encoding mangling (Graph $value endpoints can return binary).
+        sys.stdout.buffer.write(result)
+        return 0
+
+    if pretty:
+        print(format_mod.format_pretty(result))
+    else:
+        print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_refresh(args, config):
+    if args:
+        _error(f'Unknown flag: {args[0]}'); return 1
+    _info('Refreshing token...')
+    debug = _debug_enabled(config)
+    audience = config.get('default_audience') or 'graph'
+    access = auth_mod.do_token_refresh(config, audience=audience, debug=debug)
+    if not access:
+        _error('Token refresh failed.')
+        return 1
+    api_base = auth_mod.resolve_api_base(audience)
+    me = api_mod.api_get(api_base, 'me', access, debug=debug)
+    if not isinstance(me, dict):
+        _error('Auth verification failed.')
+        return 1
+    name = me.get('displayName') or me.get('DisplayName')
+    if name:
+        _info(f'Authenticated as {name}')
+    return 0
+
+
+def cmd_config(args, config):
+    """Handled specially: no auth required."""
+    profile = app_client_id = audience = ''
+    while args:
+        flag, args = args[0], args[1:]
+        if flag == '--profile':
+            profile, args = _require_value(flag, args)
+        elif flag == '--app-client-id':
+            app_client_id, args = _require_value(flag, args)
+        elif flag == '--audience':
+            audience, args = _require_value(flag, args)
+        else:
+            _error(f'Unknown flag: {flag}'); return 1
+
+    wrote = False
+    if profile:
+        config_mod.config_set('owa_piggy_profile', profile)
+        _info(f'owa-piggy profile saved: {profile}'); wrote = True
+    if app_client_id:
+        config_mod.config_set('GRAPH_APP_CLIENT_ID', app_client_id)
+        _info('App client ID saved'); wrote = True
+    if audience:
+        config_mod.config_set('default_audience', audience)
+        _info(f'Default audience saved: {audience}'); wrote = True
+
+    if not wrote:
+        _info(f'Config file: {config_mod.CONFIG_PATH}')
+        if config.get('owa_piggy_profile'):
+            _info(f"  owa_piggy_profile={config.get('owa_piggy_profile')}")
+        else:
+            _info('  owa_piggy_profile=(not set - owa-piggy picks its default)')
+        if config.get('GRAPH_APP_CLIENT_ID'):
+            _info(f"  GRAPH_APP_CLIENT_ID={config.get('GRAPH_APP_CLIENT_ID')} (app registration)")
+        else:
+            _info('  GRAPH_APP_CLIENT_ID=(not set - using owa-piggy)')
+        _info(f"  default_audience={config.get('default_audience')}")
+    return 0
+
+
+def _first_nonglobal(argv):
+    """Return the first argv token that isn't a global flag or its
+    value. Used to decide whether `--profile` later in argv is the
+    global form (forwarded to owa-piggy) or the subcommand form (writes
+    to the config file under `owa-graph config`)."""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--debug', '--verbose'):
+            i += 1
+            continue
+        if a == '--profile':
+            i += 2
+            continue
+        return a
+    return ''
+
+
+def main():
+    argv = sys.argv[1:]
+
+    if not argv or argv[0] in ('help', '--help', '-h'):
+        print_help()
+        return 0
+
+    is_config_cmd = _first_nonglobal(argv) == 'config'
+
+    debug_flag = False
+    profile_override = ''
+    filtered = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--debug', '--verbose'):
+            debug_flag = True
+            i += 1
+            continue
+        if a == '--profile' and not (is_config_cmd and 'config' in filtered):
+            if i + 1 >= len(argv):
+                _error('--profile requires a value'); return 1
+            profile_override = argv[i + 1]
+            i += 2
+            continue
+        filtered.append(a)
+        i += 1
+    argv = filtered
+
+    if not argv:
+        print_help()
+        return 0
+
+    config = config_mod.load_config()
+    if debug_flag:
+        config['debug'] = True
+        _info('DEBUG: verbose logging enabled')
+    if profile_override:
+        config['owa_piggy_profile'] = profile_override
+
+    head = argv[0]
+    rest = argv[1:]
+
+    if head == 'config':
+        return cmd_config(rest, config)
+    if head == 'refresh':
+        return cmd_refresh(rest, config)
+    if head in ('help', '--help', '-h'):
+        print_help()
+        return 0
+
+    method = head.upper()
+    if method not in HTTP_VERBS:
+        _error(
+            f"Unknown command: {head!r}. "
+            f"Expected an HTTP verb ({', '.join(sorted(HTTP_VERBS))}) "
+            f"or one of: {', '.join(sorted(RESERVED_SUBCOMMANDS))}. "
+            f"Run 'owa-graph help' for usage."
+        )
+        return 1
+
+    if not rest:
+        _error(f'{method} requires a path (e.g. `owa-graph {method} /me`)')
+        return 1
+    path, request_args = rest[0], rest[1:]
+    return cmd_request(method, path, request_args, config)
