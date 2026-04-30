@@ -271,14 +271,19 @@ def cmd_refresh(args, config):
     if not access:
         _error('Token refresh failed.')
         return 1
-    api_base = auth_mod.resolve_api_base(audience)
-    me = api_mod.api_get(api_base, 'me', access, debug=debug)
-    if not isinstance(me, dict):
-        _error('Auth verification failed.')
-        return 1
-    name = me.get('displayName') or me.get('DisplayName')
-    if name:
-        _info(f'Authenticated as {name}')
+    # /me only exists on Graph and Outlook REST. For other audiences
+    # (Azure Mgmt, Key Vault, etc.) we just confirm we got a token.
+    if audience in ('graph', 'outlook', 'outlook365'):
+        api_base = auth_mod.resolve_api_base(audience)
+        me = api_mod.api_get(api_base, 'me', access, debug=debug)
+        if not isinstance(me, dict):
+            _error('Auth verification failed.')
+            return 1
+        name = me.get('displayName') or me.get('DisplayName')
+        if name:
+            _info(f'Authenticated as {name}')
+    else:
+        _info(f'Token minted for audience {audience!r}.')
     return 0
 
 
